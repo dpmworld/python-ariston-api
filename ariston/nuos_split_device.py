@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import date
 from typing import Optional
 
 from .velis_device import AristonVelisDevice
@@ -275,3 +276,36 @@ class AristonNuosSplitDevice(AristonVelisDevice):
             self.plant_settings[SlpDeviceSettings.SLP_HEATING_RATE],
         )
         self.plant_settings[SlpDeviceSettings.SLP_HEATING_RATE] = heating_rate
+
+    @staticmethod
+    def _create_holiday_end_date(holiday_end: Optional[date]) -> Optional[str]:
+        """Format a holiday end date for the cloud payload.
+
+        Returns ``None`` when ``holiday_end`` is ``None``, which the cloud
+        interprets as "clear the holiday".
+        """
+        return (
+            None
+            if holiday_end is None
+            else holiday_end.strftime("%Y-%m-%dT00:00:00")
+        )
+
+    def set_holiday(self, holiday_end: Optional[date]) -> None:
+        """Set or clear the holiday on this Nuos device.
+
+        Pass a ``datetime.date`` to schedule the holiday end, or ``None`` to
+        clear an active holiday.
+        """
+        self.api.set_velis_slp_holiday(
+            self.gw, self._create_holiday_end_date(holiday_end)
+        )
+
+    async def async_set_holiday(self, holiday_end: Optional[date]) -> None:
+        """Async set or clear the holiday on this Nuos device.
+
+        Pass a ``datetime.date`` to schedule the holiday end, or ``None`` to
+        clear an active holiday.
+        """
+        await self.api.async_set_velis_slp_holiday(
+            self.gw, self._create_holiday_end_date(holiday_end)
+        )

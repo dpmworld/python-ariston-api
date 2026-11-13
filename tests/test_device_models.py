@@ -299,6 +299,12 @@ class AristonDeviceModelTests(unittest.TestCase):
 
         device.set_water_heater_boost(False)
         device.set_water_heater_temperature(60)
+        # The getter must reflect the requested target immediately, without
+        # waiting for the next cloud refresh (regression: setter used to write
+        # procReqTemp while the getter reads comfortTemp).
+        self.assertEqual(device.water_heater_target_temperature, 60)
+        self.assertEqual(device.data[NuosSplitProperties.COMFORT_TEMP], 60)
+        self.assertNotIn(NuosSplitProperties.PROC_REQ_TEMP, device.data)
         device.set_water_heater_reduced_temperature(42)
         device.set_water_heater_operation_mode("FAST")
         device.set_min_setpoint_temp(35)
@@ -318,6 +324,9 @@ class AristonDeviceModelTests(unittest.TestCase):
         async def set_values():
             await device.async_set_water_heater_boost(True)
             await device.async_set_water_heater_temperature(62)
+            self.assertEqual(device.water_heater_target_temperature, 62)
+            self.assertEqual(device.data[NuosSplitProperties.COMFORT_TEMP], 62)
+            self.assertNotIn(NuosSplitProperties.PROC_REQ_TEMP, device.data)
             await device.async_set_water_heater_reduced_temperature(39)
             await device.async_set_water_heater_operation_mode("GREEN")
             await device.async_set_min_setpoint_temp(36)

@@ -3,8 +3,9 @@
 import asyncio
 import unittest
 from datetime import date
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
+from ariston.ariston_api import AristonAPI, ConnectionException
 from ariston.const import (
     ConsumptionProperties,
     ConsumptionTimeInterval,
@@ -16,6 +17,7 @@ from ariston.const import (
     DeviceProperties,
     GasEnergyUnit,
     GasType,
+    GalevoDeviceAttribute,
     MenuItemNames,
     PlantMode,
     PropertyType,
@@ -27,6 +29,119 @@ from ariston.galevo_device import AristonGalevoDevice
 
 
 class AristonGalevoDeviceTests(unittest.TestCase):
+    def test_hybrid_menu_values_supply_flow_temperature_and_feature_flags(self):
+        device = self.make_device()
+        device.attributes[GalevoDeviceAttribute.HYBRID_SYS] = True
+        for item in device.data["items"]:
+            if item["id"] == DeviceProperties.CH_FLOW_TEMP:
+                item[PropertyType.VALUE] = None
+                item[PropertyType.UNIT] = None
+
+        device.menu_items.extend(
+            [
+                {
+                    "id": MenuItemNames.CH_FLOW_TEMP_SYSTEM.value,
+                    PropertyType.VALUE: 28,
+                    PropertyType.UNIT: "°C",
+                },
+                {
+                    "id": MenuItemNames.HP_WATER_FLOW_TEMP.value,
+                    PropertyType.VALUE: 27,
+                    PropertyType.UNIT: "°C",
+                },
+                {
+                    "id": MenuItemNames.CH_FLOW_TEMP_BOILER.value,
+                    PropertyType.VALUE: 49,
+                    PropertyType.UNIT: "°C",
+                },
+                {
+                    "id": MenuItemNames.GAS_POWER.value,
+                    PropertyType.VALUE: 0,
+                    PropertyType.UNIT: "kW",
+                },
+                {
+                    "id": MenuItemNames.PUMP_MODULATION.value,
+                    PropertyType.VALUE: 0,
+                    PropertyType.UNIT: "%",
+                },
+                {
+                    "id": MenuItemNames.DHW_FLOW_RATE.value,
+                    PropertyType.VALUE: 3276,
+                    PropertyType.UNIT: "l/min",
+                },
+            ]
+        )
+
+        device._update_state()
+
+        self.assertEqual(device.ch_flow_temp_value, 28)
+        self.assertEqual(device.ch_flow_temp_unit, "°C")
+        self.assertTrue(
+            device.custom_features[str(MenuItemNames.HP_WATER_FLOW_TEMP.value)]
+        )
+        self.assertTrue(
+            device.custom_features[str(MenuItemNames.CH_FLOW_TEMP_BOILER.value)]
+        )
+        self.assertTrue(device.custom_features[str(MenuItemNames.GAS_POWER.value)])
+        self.assertTrue(
+            device.custom_features[str(MenuItemNames.PUMP_MODULATION.value)]
+        )
+        self.assertFalse(
+            device.custom_features[str(MenuItemNames.DHW_FLOW_RATE.value)]
+        )
+
+    def test_async_update_requests_hybrid_menu_items_only_for_hybrid_devices(self):
+        device = self.make_device()
+        device.attributes[GalevoDeviceAttribute.HYBRID_SYS] = True
+        device.api.async_get_properties = AsyncMock(return_value=self.make_data())
+        device.api.async_get_menu_items = AsyncMock(return_value=device.menu_items)
+
+        asyncio.run(device.async_update_state())
+
+        device.api.async_get_menu_items.assert_awaited_once_with(
+            "gw-1", include_hybrid_items=True
+        )
+
+    def test_dhw_program_temperatures_are_typed_and_optional(self):
+        device = self.make_device()
+        device._set_item_by_id(DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP, "52.5")
+        device._set_item_by_id(DeviceProperties.DHW_TIMEPROG_ECONOMY_TEMP, 0)
+
+        self.assertEqual(device.dhw_program_comfort_temp_value, 52.5)
+        self.assertEqual(device.dhw_program_economy_temp_value, 0.0)
+        self.assertEqual(device.dhw_program_comfort_temp_unit, "°C")
+        self.assertEqual(device.dhw_program_economy_temp_unit, "°C")
+        device._update_state()
+        self.assertTrue(device.custom_features[DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP])
+        self.assertTrue(device.custom_features[DeviceProperties.DHW_TIMEPROG_ECONOMY_TEMP])
+
+        for item in device.data["items"]:
+            if item["id"] == DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP:
+                item[PropertyType.VALUE] = "nan"
+            elif item["id"] == DeviceProperties.DHW_TIMEPROG_ECONOMY_TEMP:
+                item[PropertyType.VALUE] = None
+        device._update_state()
+        self.assertIsNone(device.dhw_program_comfort_temp_value)
+        self.assertIsNone(device.dhw_program_economy_temp_value)
+        self.assertFalse(device.custom_features[DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP])
+        self.assertFalse(device.custom_features[DeviceProperties.DHW_TIMEPROG_ECONOMY_TEMP])
+
+        device._set_item_by_id(DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP, True)
+        self.assertIsNone(device.dhw_program_comfort_temp_value)
+
+        device.data["items"] = [
+            item for item in device.data["items"]
+            if item["id"] != DeviceProperties.DHW_TIMEPROG_ECONOMY_TEMP
+        ]
+        self.assertIsNone(device.dhw_program_economy_temp_value)
+        device._set_item_by_id(DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP, 45)
+        next(
+            item for item in device.data["items"]
+            if item["id"] == DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP
+        )[PropertyType.UNIT] = "%"
+        device._update_state()
+        self.assertFalse(device.custom_features[DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP])
+
     def make_device(self, metric=True):
         api = Mock()
         device = AristonGalevoDevice(
@@ -293,6 +408,121 @@ class AristonGalevoDeviceTests(unittest.TestCase):
 
         asyncio.run(refresh_without_features())
         async_no_features.api.async_get_features_for_device.assert_awaited_once_with("gw-1")
+
+    def test_menu_http_500_and_550_preserve_previous_items_and_refresh_state(self):
+        for status in (500, 550):
+            with self.subTest(status=status):
+                device = self.make_device()
+                previous_menu_items = list(device.menu_items)
+                fresh_data = self.make_data()
+                fresh_data["items"][0][PropertyType.VALUE] = 42
+                device.api.async_get_properties = AsyncMock(return_value=fresh_data)
+                device.api.async_get_menu_items = AsyncMock(
+                    side_effect=ConnectionException(status)
+                )
+
+                async def refresh():
+                    await device.async_update_state()
+
+                with self.assertLogs("ariston.galevo_device", level="WARNING"):
+                    asyncio.run(refresh())
+
+                self.assertEqual(device.data, fresh_data)
+                self.assertEqual(device.menu_items, previous_menu_items)
+                self.assertEqual(device.signal_strength_value, 4)
+
+    def test_async_update_state_survives_properties_batch_500(self):
+        device = self.make_device()
+        api = AristonAPI("user", "password")
+        device.api = api
+        requested_items = DeviceProperties.list(0)[:3]
+
+        async def post(path, body):
+            if len(body["items"]) > 2:
+                raise ConnectionException(500)
+            return {
+                "items": [
+                    {"id": item["id"], "zn": item["zn"], "value": 1}
+                    for item in body["items"]
+                ]
+            }
+
+        async def refresh():
+            with patch.object(api, "get_items", return_value=requested_items), patch.object(
+                api, "_async_post", new=AsyncMock(side_effect=post)
+            ), patch.object(api, "async_get_menu_items", new=AsyncMock(return_value=[])):
+                await device.async_update_state()
+
+        asyncio.run(refresh())
+        self.assertEqual(
+            [item["id"] for item in device.data["items"]],
+            [item["id"] for item in requested_items],
+        )
+
+    def test_menu_http_failure_on_first_refresh_and_recovery(self):
+        device = self.make_device()
+        device.menu_items = []
+        device.api.async_get_properties = AsyncMock(return_value=self.make_data())
+        device.api.async_get_menu_items = AsyncMock(
+            side_effect=[ConnectionException(500), [{"id": 1, PropertyType.VALUE: 3}]]
+        )
+
+        async def refresh_twice():
+            await device.async_update_state()
+            self.assertEqual(device.menu_items, [])
+            self.assertEqual(device.data, self.make_data())
+            await device.async_update_state()
+
+        with self.assertLogs("ariston.galevo_device", level="WARNING"):
+            asyncio.run(refresh_twice())
+
+        self.assertEqual(device.menu_items, [{"id": 1, PropertyType.VALUE: 3}])
+
+    def test_primary_properties_and_non_transient_menu_errors_still_raise(self):
+        device = self.make_device()
+        device.api.async_get_properties = AsyncMock(
+            side_effect=ConnectionException(500)
+        )
+        device.api.async_get_menu_items = AsyncMock(return_value=device.menu_items)
+
+        async def refresh_primary_failure():
+            await device.async_update_state()
+
+        with self.assertRaises(ConnectionException):
+            asyncio.run(refresh_primary_failure())
+
+        device.api.async_get_properties = AsyncMock(return_value=self.make_data())
+        device.api.async_get_menu_items = AsyncMock(
+            side_effect=ConnectionException(401)
+        )
+
+        async def refresh_menu_auth_failure():
+            await device.async_update_state()
+
+        with self.assertRaises(ConnectionException):
+            asyncio.run(refresh_menu_auth_failure())
+
+    def test_sync_menu_http_failure_preserves_previous_items(self):
+        device = self.make_device()
+        previous_menu_items = list(device.menu_items)
+        fresh_data = self.make_data()
+        fresh_data["items"][0][PropertyType.VALUE] = 42
+        device.api.get_properties.return_value = fresh_data
+        device.api.get_menu_items.side_effect = ConnectionException(500)
+
+        with self.assertLogs("ariston.galevo_device", level="WARNING"):
+            device.update_state()
+
+        self.assertEqual(device.data, fresh_data)
+        self.assertEqual(device.menu_items, previous_menu_items)
+
+    def test_sync_non_transient_menu_errors_still_raise(self):
+        device = self.make_device()
+        device.api.get_properties.return_value = self.make_data()
+        device.api.get_menu_items.side_effect = ConnectionException(401)
+
+        with self.assertRaises(ConnectionException):
+            device.update_state()
 
     def test_consumption_settings_and_energy_account_paths(self):
         device = self.make_device()

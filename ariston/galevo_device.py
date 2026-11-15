@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 
 import logging
+import math
 from datetime import date
 from typing import Any, Optional
 
-from .ariston_api import AristonAPI
+from .ariston_api import AristonAPI, ConnectionException
 from .const import (
     ConsumptionProperties,
     ConsumptionTimeInterval,
@@ -16,8 +17,10 @@ from .const import (
     CustomDeviceFeatures,
     DeviceFeatures,
     DeviceProperties,
+    GalevoDeviceAttribute,
     GasEnergyUnit,
     GasType,
+    HOLIDAY_DATE_FORMAT,
     PlantMode,
     PropertyType,
     ThermostatProperties,
@@ -28,6 +31,7 @@ from .const import (
 from .device import AristonDevice
 
 _LOGGER = logging.getLogger(__name__)
+_MENU_ITEM_UNAVAILABLE_VALUE = 3276
 
 
 class AristonGalevoDevice(AristonDevice):
@@ -43,9 +47,9 @@ class AristonGalevoDevice(AristonDevice):
         super().__init__(api, attributes)
         self.umsys = "si" if is_metric else "us"
         self.language_tag = language_tag
-        self.consumptions_settings: dict[str, Any] = dict()
-        self.energy_account: dict[str, Any] = dict()
-        self.menu_items: list[dict[str, Any]] = list()
+        self.consumptions_settings: dict[str, Any] = {}
+        self.energy_account: dict[str, Any] = {}
+        self.menu_items: list[dict[str, Any]] = []
 
     @property
     def consumption_type(self) -> str:
@@ -84,6 +88,24 @@ class AristonGalevoDevice(AristonDevice):
         self.custom_features[DeviceProperties.CH_FLOW_TEMP] = (
             self.ch_flow_temp_value is not None
         )
+        for menu_item in (
+            MenuItemNames.CH_FLOW_TEMP_BOILER,
+            MenuItemNames.GAS_POWER,
+            MenuItemNames.DHW_FLOW_RATE,
+            MenuItemNames.PUMP_MODULATION,
+            MenuItemNames.HP_WATER_FLOW_TEMP,
+        ):
+            self.custom_features[str(menu_item.value)] = (
+                self.get_menu_item_value(menu_item.value) is not None
+            )
+        for item_id in (
+            DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP,
+            DeviceProperties.DHW_TIMEPROG_ECONOMY_TEMP,
+        ):
+            self.custom_features[item_id] = (
+                self._get_dhw_program_temperature(item_id) is not None
+                and self._get_item_by_id(item_id, PropertyType.UNIT) in ("°C", "°F")
+            )
         self.custom_features[DeviceProperties.IS_QUIET] = (
             self.is_quiet_value is not None
         )
@@ -99,7 +121,16 @@ class AristonGalevoDevice(AristonDevice):
             self.language_tag,
             self.umsys,
         )
-        self.menu_items = self.api.get_menu_items(self.gw)
+        try:
+            self.menu_items = self.api.get_menu_items(
+                self.gw,
+                include_hybrid_items=(
+                    self.attributes.get(GalevoDeviceAttribute.HYBRID_SYS) is True
+                ),
+            )
+        except ConnectionException as error:
+            if not self._should_retain_menu_items_after_error(error):
+                raise
         self._update_state()
 
     async def async_update_state(self) -> None:
@@ -114,9 +145,42 @@ class AristonGalevoDevice(AristonDevice):
                 self.language_tag,
                 self.umsys,
             ),
-            self.api.async_get_menu_items(self.gw),
+            self._async_get_menu_items(
+                include_hybrid_items=(
+                    self.attributes.get(GalevoDeviceAttribute.HYBRID_SYS) is True
+                )
+            ),
         )
         self._update_state()
+
+    async def _async_get_menu_items(
+        self, include_hybrid_items: bool = False
+    ) -> list[dict[str, Any]]:
+        """Get menu items while retaining the last values for server errors."""
+        try:
+            return await self.api.async_get_menu_items(
+                self.gw, include_hybrid_items=include_hybrid_items
+            )
+        except ConnectionException as error:
+            if not self._should_retain_menu_items_after_error(error):
+                raise
+            return self.menu_items
+
+    def _should_retain_menu_items_after_error(
+        self, error: ConnectionException
+    ) -> bool:
+        """Log and identify menu server errors that can use cached values."""
+        status = error.args[0] if error.args else None
+        if status not in (500, 550):
+            return False
+
+        _LOGGER.warning(
+            "Could not fetch menu items for gateway %s (HTTP %s); "
+            "retaining the last successful values",
+            self.gw,
+            status,
+        )
+        return True
 
     def _get_features(self) -> None:
         """Set custom features"""
@@ -170,6 +234,45 @@ class AristonGalevoDevice(AristonDevice):
     def water_heater_target_temperature(self) -> Optional[float]:
         """Get water heater target temperature"""
         return self._get_item_by_id(DeviceProperties.DHW_TEMP, PropertyType.VALUE)
+
+    def _get_dhw_program_temperature(self, item_id: DeviceProperties) -> Optional[float]:
+        """Return a valid DHW program temperature, including zero."""
+        value = self._get_item_by_id(item_id, PropertyType.VALUE)
+        if isinstance(value, bool):
+            return None
+        try:
+            temperature = float(value)
+        except (TypeError, ValueError):
+            return None
+        return temperature if math.isfinite(temperature) else None
+
+    @property
+    def dhw_program_comfort_temp_value(self) -> Optional[float]:
+        """Get the DHW time program comfort temperature."""
+        return self._get_dhw_program_temperature(
+            DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP
+        )
+
+    @property
+    def dhw_program_comfort_temp_unit(self) -> Optional[str]:
+        """Get the DHW time program comfort temperature unit."""
+        return self._get_item_by_id(
+            DeviceProperties.DHW_TIMEPROG_COMFORT_TEMP, PropertyType.UNIT
+        )
+
+    @property
+    def dhw_program_economy_temp_value(self) -> Optional[float]:
+        """Get the DHW time program economy temperature."""
+        return self._get_dhw_program_temperature(
+            DeviceProperties.DHW_TIMEPROG_ECONOMY_TEMP
+        )
+
+    @property
+    def dhw_program_economy_temp_unit(self) -> Optional[str]:
+        """Get the DHW time program economy temperature unit."""
+        return self._get_item_by_id(
+            DeviceProperties.DHW_TIMEPROG_ECONOMY_TEMP, PropertyType.UNIT
+        )
 
     @property
     def water_heater_temperature_decimals(self) -> int:
@@ -362,7 +465,12 @@ class AristonGalevoDevice(AristonDevice):
     @property
     def ch_flow_temp_value(self) -> Optional[str]:
         """Get central heating flow temperature value"""
-        return self._get_item_by_id(DeviceProperties.CH_FLOW_TEMP, PropertyType.VALUE)
+        value = self._get_item_by_id(
+            DeviceProperties.CH_FLOW_TEMP, PropertyType.VALUE
+        )
+        if value is not None:
+            return value
+        return self.get_menu_item_value(MenuItemNames.CH_FLOW_TEMP_SYSTEM.value)
 
     @property
     def outside_temp_value(self) -> str:
@@ -384,7 +492,14 @@ class AristonGalevoDevice(AristonDevice):
     @property
     def ch_flow_temp_unit(self) -> str:
         """Get central heating flow temperature unit"""
-        return self._get_item_by_id(DeviceProperties.CH_FLOW_TEMP, PropertyType.UNIT)
+        unit = self._get_item_by_id(
+            DeviceProperties.CH_FLOW_TEMP, PropertyType.UNIT
+        )
+        if unit is not None:
+            return unit
+        return self._get_menu_item_by_id(
+            MenuItemNames.CH_FLOW_TEMP_SYSTEM.value, PropertyType.UNIT
+        )
 
     @property
     def is_flame_on_value(self) -> bool:
@@ -480,6 +595,22 @@ class AristonGalevoDevice(AristonDevice):
         return self._get_menu_item_by_id(
             MenuItemNames.CH_RETURN_TEMP.value, PropertyType.UNIT
         )
+
+    def get_menu_item_value(self, menu_item_id: int) -> Any:
+        """Return a value, treating the gateway's unavailable marker as empty."""
+        value = self._get_menu_item_by_id(menu_item_id, PropertyType.VALUE)
+        if value is None:
+            return None
+        try:
+            if float(value) == _MENU_ITEM_UNAVAILABLE_VALUE:
+                return None
+        except (TypeError, ValueError):
+            pass
+        return value
+
+    def get_menu_item_unit(self, menu_item_id: int) -> Any:
+        """Return a menu item's reported unit."""
+        return self._get_menu_item_by_id(menu_item_id, PropertyType.UNIT)
 
     def get_measured_temp_unit(self, zone: int) -> str:
         """Get zone measured temp unit"""
@@ -979,7 +1110,9 @@ class AristonGalevoDevice(AristonDevice):
     @staticmethod
     def _create_holiday_end_date(holiday_end: Optional[date]):
         return (
-            None if holiday_end is None else holiday_end.strftime("%Y-%m-%dT00:00:00")
+            None
+            if holiday_end is None
+            else holiday_end.strftime(HOLIDAY_DATE_FORMAT)
         )
 
     def _set_holiday(self, holiday_end_date: Optional[str]):
